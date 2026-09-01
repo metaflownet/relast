@@ -1,0 +1,29 @@
+{
+  "manifest_version": 2,
+  "name": "ReLast Tab",
+  "version": "1.2.7",
+  "description": "Returns to the most recently used tab after the active tab closes.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png",
+    "256": "icons/icon-256.png",
+    "512": "icons/icon-512.png"
+  },
+  "permissions": [
+    "storage"
+  ],
+  "background": {
+    "scripts": [
+      "history.js",
+      "background.js"
+    ],
+    "persistent": false
+  },
+  "browser_specific_settings": {
+    "safari": {
+      "strict_min_version": "16.4"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "safari-relast-tab",
+  "version": "1.2.7",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "install:app": "./install.sh"
+  }
+}

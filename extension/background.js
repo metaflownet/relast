@@ -1,0 +1,677 @@
+// history.js is loaded immediately before this file by the Safari manifest.
+
+const STATE_STORAGE_KEY = 'sessionState';
+// Safari may defer tabs.onRemoved for several seconds after it has already
+// activated the adjacent fallback tab. Keep this bounded so that an unrelated
+// background-tab close is not mistaken for closing the active tab.
+const CLOSE_EVENT_REORDER_WINDOW_MS = 10000;
+const RESTORE_CONFIRMATION_WINDOW_MS = 1500;
+const MAX_HYDRATE_ATTEMPTS = 3;
+
+console.info('[ReLast Tab] background loaded');
+
+let windowHistory = {};
+let tabMetadata = {};
+let lastActivationByWindow = {};
+let historyLoaded = false;
+let historyLoadPromise = null;
+let historyTaskQueue = Promise.resolve();
+let pendingRestoreByWindow = {};
+let hydrateAttempts = 0;
+
+chrome.runtime.onStartup.addListener(() => {
+  void enqueueHistoryTask('startup reset', async () => {
+    await resetStateFromCurrentTabs('browser startup');
+  });
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  void enqueueHistoryTask('install reset', async () => {
+    await resetStateFromCurrentTabs('extension install/update');
+  });
+});
+
+chrome.tabs.onCreated.addListener((tab) => {
+  const eventTime = Date.now();
+
+  console.debug('[ReLast Tab] created', tab.windowId, tab.id, Boolean(tab.active));
+
+  void enqueueHistoryTask('tab creation', async () => {
+    await handleTabCreated(tab, eventTime);
+  });
+});
+
+chrome.tabs.onActivated.addListener((activeInfo) => {
+  const eventTime = Date.now();
+
+  console.debug('[ReLast Tab] activated', activeInfo.windowId, activeInfo.tabId);
+
+  void enqueueHistoryTask('tab activation', async () => {
+    await handleTabActivated(activeInfo, eventTime);
+  });
+});
+
+if (chrome.tabs.onAttached) {
+  chrome.tabs.onAttached.addListener((tabId, attachInfo) => {
+    void enqueueHistoryTask('tab attach', async () => {
+      await handleTabAttached(tabId, attachInfo);
+    });
+  });
+}
+
+if (chrome.tabs.onDetached) {
+  chrome.tabs.onDetached.addListener((tabId, detachInfo) => {
+    void enqueueHistoryTask('tab detach', async () => {
+      await handleTabDetached(tabId, detachInfo);
+    });
+  });
+}
+
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+  const eventTime = Date.now();
+
+  console.debug('[ReLast Tab] removed', removeInfo.windowId, tabId);
+
+  void enqueueHistoryTask('tab removal', async () => {
+    await handleTabRemoved(tabId, removeInfo, eventTime);
+  });
+});
+
+// Safari does not currently expose tabs.onReplaced. Chrome does, so retain the
+// handler when this source is loaded in a browser that supports it.
+if (chrome.tabs.onReplaced) {
+  chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+    void enqueueHistoryTask('tab replacement', async () => {
+      await handleTabReplaced(addedTabId, removedTabId);
+    });
+  });
+}
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  void enqueueHistoryTask('window removal', async () => {
+    await handleWindowRemoved(windowId);
+  });
+});
+
+void enqueueHistoryTask('initial hydration', async () => {
+  await ensureHistoryLoaded();
+});
+
+function enqueueHistoryTask(label, task) {
+  const runTask = async () => {
+    try {
+      await task();
+    } catch (error) {
+      logError(`Unhandled error during ${label}:`, error);
+    }
+  };
+
+  // Passing runTask as both the fulfillment and rejection handler ensures the
+  // queue keeps moving even when a previous task throws, while still handling
+  // all tasks serially (no concurrent event handlers).
+  historyTaskQueue = historyTaskQueue.then(runTask, runTask);
+  return historyTaskQueue;
+}
+
+async function ensureHistoryLoaded() {
+  if (historyLoaded) {
+    return;
+  }
+
+  if (!historyLoadPromise) {
+    historyLoadPromise = hydrateState();
+  }
+
+  await historyLoadPromise;
+}
+
+async function hydrateState() {
+  try {
+    const [{ [STATE_STORAGE_KEY]: storedState }, openTabs] = await Promise.all([
+      chrome.storage.session.get(STATE_STORAGE_KEY),
+      chrome.tabs.query({}),
+    ]);
+
+    const openTabsById = buildOpenTabsById(openTabs);
+    const normalizedState = storedState && typeof storedState === 'object' ? storedState : {};
+
+    let nextWindowHistory = normalizeWindowHistory(normalizedState.windowHistory, MAX_HISTORY_SIZE);
+    if (Object.keys(nextWindowHistory).length === 0) {
+      nextWindowHistory = buildHistoryFromTabs(openTabs);
+    }
+
+    windowHistory = pruneWindowHistory(nextWindowHistory, openTabsById, MAX_HISTORY_SIZE);
+    tabMetadata = pruneTabMetadata(
+      normalizeTabMetadata(normalizedState.tabMetadata),
+      openTabsById,
+    );
+    lastActivationByWindow = pruneActivationByWindow(
+      normalizeActivationByWindow(normalizedState.lastActivationByWindow),
+      openTabsById,
+    );
+    pendingRestoreByWindow =
+      normalizedState.pendingRestoreByWindow &&
+      typeof normalizedState.pendingRestoreByWindow === 'object' &&
+      !Array.isArray(normalizedState.pendingRestoreByWindow)
+        ? normalizedState.pendingRestoreByWindow
+        : {};
+    historyLoaded = true;
+    hydrateAttempts = 0;
+
+    await persistState();
+  } catch (error) {
+    hydrateAttempts += 1;
+    logError('Failed to hydrate session state:', error, 'attempt:', hydrateAttempts);
+
+    // Leave historyLoaded = false so the next ensureHistoryLoaded() call retries,
+    // up to MAX_HYDRATE_ATTEMPTS. After the cap, fall back to an empty state so
+    // event handlers can still make forward progress instead of blocking forever.
+    if (hydrateAttempts >= MAX_HYDRATE_ATTEMPTS) {
+      windowHistory = {};
+      tabMetadata = {};
+      lastActivationByWindow = {};
+      pendingRestoreByWindow = {};
+      historyLoaded = true;
+    }
+  } finally {
+    historyLoadPromise = null;
+  }
+}
+
+async function resetStateFromCurrentTabs(reason) {
+  const openTabs = await chrome.tabs.query({});
+
+  windowHistory = buildHistoryFromTabs(openTabs);
+  tabMetadata = buildTabMetadataFromTabs(openTabs);
+  lastActivationByWindow = buildActivationStateFromTabs(openTabs, windowHistory);
+  pendingRestoreByWindow = {};
+  historyLoaded = true;
+  historyLoadPromise = null;
+  hydrateAttempts = 0;
+
+  await persistState();
+}
+
+async function persistState() {
+  await chrome.storage.session.set({
+    [STATE_STORAGE_KEY]: {
+      windowHistory,
+      tabMetadata,
+      lastActivationByWindow,
+      pendingRestoreByWindow,
+    },
+  });
+}
+
+function buildHistoryFromTabs(tabs) {
+  let nextHistory = {};
+
+  for (const tab of tabs) {
+    if (!tab.active || !isValidTabId(tab.id) || !isValidWindowId(tab.windowId)) {
+      continue;
+    }
+
+    nextHistory = addToWindowHistory(nextHistory, tab.windowId, tab.id, MAX_HISTORY_SIZE);
+  }
+
+  return nextHistory;
+}
+
+function buildTabMetadataFromTabs(tabs) {
+  let nextTabMetadata = {};
+
+  for (const tab of tabs) {
+    nextTabMetadata = upsertTabMetadata(nextTabMetadata, tab);
+  }
+
+  return nextTabMetadata;
+}
+
+function buildActivationStateFromTabs(tabs, currentWindowHistory) {
+  const nextActivationByWindow = {};
+
+  for (const tab of tabs) {
+    if (!tab.active || !isValidTabId(tab.id) || !isValidWindowId(tab.windowId)) {
+      continue;
+    }
+
+    nextActivationByWindow[String(tab.windowId)] = {
+      tabId: tab.id,
+      eventTime: 0,
+      previousHistory: getWindowHistory(currentWindowHistory, tab.windowId),
+    };
+  }
+
+  return nextActivationByWindow;
+}
+
+function buildOpenTabsById(tabs) {
+  const openTabsById = {};
+
+  for (const tab of tabs) {
+    if (isValidTabId(tab.id) && isValidWindowId(tab.windowId)) {
+      openTabsById[tab.id] = tab;
+    }
+  }
+
+  return openTabsById;
+}
+
+async function handleTabCreated(tab, eventTime) {
+  await ensureHistoryLoaded();
+
+  tabMetadata = upsertTabMetadata(tabMetadata, tab);
+
+  // Safari often creates a new tab already active without subsequently
+  // emitting tabs.onActivated for it. Treat an active creation as activation;
+  // if onActivated does arrive, the duplicate guard handles it.
+  if (tab.active && isValidTabId(tab.id) && isValidWindowId(tab.windowId)) {
+    const previousHistory = getWindowHistory(windowHistory, tab.windowId);
+    windowHistory = addToWindowHistory(
+      windowHistory,
+      tab.windowId,
+      tab.id,
+      MAX_HISTORY_SIZE,
+    );
+    lastActivationByWindow = setActivationRecord(lastActivationByWindow, tab.windowId, {
+      tabId: tab.id,
+      eventTime,
+      previousHistory,
+    });
+  }
+
+  await persistState();
+}
+
+async function handleTabActivated(activeInfo, eventTime) {
+  await ensureHistoryLoaded();
+
+  const tab = await safeGetTab(activeInfo.tabId);
+  if (!tab) {
+    windowHistory = removeTabFromAllWindowHistories(windowHistory, activeInfo.tabId);
+    tabMetadata = removeTabMetadata(tabMetadata, activeInfo.tabId);
+    lastActivationByWindow = removeTabFromActivationByWindow(
+      lastActivationByWindow,
+      activeInfo.tabId,
+    );
+    await persistState();
+    return;
+  }
+
+  tabMetadata = upsertTabMetadata(tabMetadata, tab);
+
+  const pendingRestore = pendingRestoreByWindow[String(activeInfo.windowId)];
+  const currentMostRecentTabId = getWindowHistory(windowHistory, activeInfo.windowId)[0] ?? null;
+
+  // Safari can emit the same adjacent-tab activation more than once while a
+  // tab is closing. Re-recording the duplicate destroys previousHistory,
+  // which is the evidence that the subsequently removed tab was active.
+  if (!pendingRestore && currentMostRecentTabId === activeInfo.tabId) {
+    console.debug('[ReLast Tab] duplicate activation ignored', activeInfo.windowId, activeInfo.tabId);
+    await persistState();
+    return;
+  }
+
+  const pendingResolution = resolvePendingRestoreActivation({
+    windowHistory,
+    lastActivationByWindow,
+    windowId: activeInfo.windowId,
+    activatedTabId: activeInfo.tabId,
+    eventTime,
+    pendingRestore: pendingRestore
+      ? {
+          ...pendingRestore,
+          restoreWindowMs: RESTORE_CONFIRMATION_WINDOW_MS,
+        }
+      : null,
+  });
+
+  if (pendingResolution.action === 'expired' || pendingResolution.action === 'override') {
+    delete pendingRestoreByWindow[String(activeInfo.windowId)];
+  } else if (pendingResolution.action === 'confirmed') {
+    delete pendingRestoreByWindow[String(activeInfo.windowId)];
+  }
+
+  if (pendingResolution.action !== 'normal') {
+    windowHistory = pendingResolution.windowHistory;
+    lastActivationByWindow = pendingResolution.lastActivationByWindow;
+  }
+
+  const previousHistory = pendingResolution.previousHistory;
+
+  windowHistory = addToWindowHistory(
+    windowHistory,
+    activeInfo.windowId,
+    activeInfo.tabId,
+    MAX_HISTORY_SIZE,
+  );
+  lastActivationByWindow = setActivationRecord(lastActivationByWindow, activeInfo.windowId, {
+    tabId: activeInfo.tabId,
+    eventTime,
+    previousHistory,
+  });
+
+  await persistState();
+}
+
+async function handleTabDetached(tabId, detachInfo) {
+  await ensureHistoryLoaded();
+
+  if (!isValidTabId(tabId) || !isValidWindowId(detachInfo.oldWindowId)) {
+    return;
+  }
+
+  windowHistory = removeTabFromAllWindowHistories(windowHistory, tabId);
+  lastActivationByWindow = removeTabFromActivationByWindow(lastActivationByWindow, tabId);
+  delete pendingRestoreByWindow[String(detachInfo.oldWindowId)];
+
+  // Keep tabMetadata's windowId pinned to oldWindowId until onAttached fires.
+  // If handleTabRemoved races in between detach and attach, opener-based
+  // restore fallback needs to resolve against the window the tab actually left.
+  const normalizedTabMetadata = normalizeTabMetadata(tabMetadata);
+  const existingMetadata = normalizedTabMetadata[String(tabId)];
+  if (existingMetadata) {
+    tabMetadata = {
+      ...normalizedTabMetadata,
+      [String(tabId)]: {
+        ...existingMetadata,
+        windowId: detachInfo.oldWindowId,
+      },
+    };
+  }
+
+  await persistState();
+}
+
+async function handleTabAttached(tabId, attachInfo) {
+  await ensureHistoryLoaded();
+
+  const tab = await safeGetTab(tabId);
+  if (!tab) {
+    removeInvalidTabs([tabId]);
+    await persistState();
+    return;
+  }
+
+  tabMetadata = upsertTabMetadata(tabMetadata, tab);
+  lastActivationByWindow = moveTabInActivationByWindow(
+    lastActivationByWindow,
+    tabId,
+    attachInfo.newWindowId,
+  );
+  delete pendingRestoreByWindow[String(attachInfo.newWindowId)];
+
+  await persistState();
+}
+
+async function handleTabRemoved(tabId, removeInfo, eventTime) {
+  await ensureHistoryLoaded();
+
+  const activationRecord = normalizeActivationByWindow(lastActivationByWindow)[
+    String(removeInfo.windowId)
+  ];
+
+  const restorePlan = resolveCloseRestorePlan({
+    windowHistory,
+    windowId: removeInfo.windowId,
+    removedTabId: tabId,
+    lastActivationByWindow,
+    tabMetadata,
+    removalTime: eventTime,
+    transientActivationWindowMs: CLOSE_EVENT_REORDER_WINDOW_MS,
+  });
+
+  console.debug('[ReLast Tab] restore plan', {
+    removedWasMostRecent: restorePlan.removedWasMostRecent,
+    usedTransientActivation: restorePlan.usedTransientActivation,
+    restoreTargetTabId: restorePlan.restoreTargetTabId,
+    isWindowClosing: removeInfo.isWindowClosing,
+    currentHistory: getWindowHistory(windowHistory, removeInfo.windowId),
+    activationTabId: activationRecord?.tabId ?? null,
+    activationPreviousHistory: activationRecord?.previousHistory ?? [],
+    activationToRemovalMs: activationRecord
+      ? eventTime - activationRecord.eventTime
+      : null,
+  });
+
+  windowHistory = restorePlan.windowHistory;
+  tabMetadata = removeTabMetadata(tabMetadata, tabId);
+  lastActivationByWindow = removeTabFromActivationByWindow(lastActivationByWindow, tabId);
+  delete pendingRestoreByWindow[String(removeInfo.windowId)];
+
+  await persistState();
+
+  if (!restorePlan.removedWasMostRecent || removeInfo.isWindowClosing) {
+    return;
+  }
+
+  const nextTab = await resolveRestoreTargetTab(
+    removeInfo.windowId,
+    restorePlan.restoreTargetTabId,
+    restorePlan.openerFallbackTabId,
+  );
+  if (!nextTab) {
+    return;
+  }
+
+  pendingRestoreByWindow[String(removeInfo.windowId)] = {
+    targetTabId: nextTab.id,
+    removalTime: eventTime,
+    historyAfterClose: getWindowHistory(windowHistory, removeInfo.windowId),
+  };
+
+  // Persist the pending restore before any async Chrome API calls so that a
+  // service worker restart between here and the confirmation step can still
+  // recover the pending state.
+  await persistState();
+
+  // Safari has already selected its native fallback before delivering
+  // onRemoved. Apply the previous tab immediately to minimize the fallback flash.
+  const updatedTab = await safeUpdateTab(nextTab.id, { active: true });
+  console.debug('[ReLast Tab] restore update', nextTab.id, Boolean(updatedTab));
+  if (updatedTab) {
+    const activeTab = await safeGetActiveTabInWindow(removeInfo.windowId);
+    if (activeTab?.id === nextTab.id) {
+      delete pendingRestoreByWindow[String(removeInfo.windowId)];
+      const previousHistory = getWindowHistory(windowHistory, removeInfo.windowId);
+
+      windowHistory = addToWindowHistory(
+        windowHistory,
+        removeInfo.windowId,
+        nextTab.id,
+        MAX_HISTORY_SIZE,
+      );
+      lastActivationByWindow = setActivationRecord(lastActivationByWindow, removeInfo.windowId, {
+        tabId: nextTab.id,
+        eventTime,
+        previousHistory,
+      });
+      await persistState();
+    }
+    // If a different tab is now active, pendingRestoreByWindow stays set.
+    // handleTabActivated will consume it as 'confirmed', 'override', or 'expired'.
+  } else {
+    delete pendingRestoreByWindow[String(removeInfo.windowId)];
+    // Persist the deletion so that a service worker restart after a failed
+    // safeUpdateTab() does not reload a stale pending restore from storage.
+    await persistState();
+  }
+}
+
+async function handleTabReplaced(addedTabId, removedTabId) {
+  await ensureHistoryLoaded();
+
+  if (!isValidTabId(removedTabId) || !isValidTabId(addedTabId)) {
+    return;
+  }
+
+  const addedTab = await safeGetTab(addedTabId);
+  if (!addedTab) {
+    removeInvalidTabs([removedTabId]);
+    await persistState();
+    return;
+  }
+
+  windowHistory = replaceTabInAllWindowHistories(windowHistory, removedTabId, addedTabId);
+  tabMetadata = replaceTabMetadata(tabMetadata, removedTabId, addedTabId, addedTab);
+  lastActivationByWindow = replaceTabInActivationByWindow(
+    lastActivationByWindow,
+    removedTabId,
+    addedTabId,
+  );
+  replacePendingRestoreTabId(removedTabId, addedTabId);
+
+  await persistState();
+}
+
+async function handleWindowRemoved(windowId) {
+  await ensureHistoryLoaded();
+
+  windowHistory = removeWindowHistory(windowHistory, windowId);
+  tabMetadata = removeWindowTabMetadata(tabMetadata, windowId);
+  lastActivationByWindow = removeWindowActivation(lastActivationByWindow, windowId);
+  delete pendingRestoreByWindow[String(windowId)];
+
+  await persistState();
+}
+
+async function resolveRestoreTargetTab(windowId, restoreTargetTabId, openerFallbackTabId) {
+  const invalidTabIds = [];
+
+  if (isValidTabId(restoreTargetTabId)) {
+    const preferredTab = await safeGetTab(restoreTargetTabId);
+    if (preferredTab && preferredTab.windowId === windowId) {
+      return preferredTab;
+    }
+
+    invalidTabIds.push(restoreTargetTabId);
+  }
+
+  let foundTab = null;
+  for (const tabId of getWindowHistory(windowHistory, windowId)) {
+    if (tabId === restoreTargetTabId) {
+      continue;
+    }
+
+    const tab = await safeGetTab(tabId);
+    if (!tab || tab.windowId !== windowId) {
+      invalidTabIds.push(tabId);
+      continue;
+    }
+
+    foundTab = tab;
+    break;
+  }
+
+  if (!foundTab && isValidTabId(openerFallbackTabId)) {
+    const openerTab = await safeGetTab(openerFallbackTabId);
+    if (openerTab && openerTab.windowId === windowId) {
+      foundTab = openerTab;
+    } else if (openerFallbackTabId !== restoreTargetTabId) {
+      invalidTabIds.push(openerFallbackTabId);
+    }
+  }
+
+  if (invalidTabIds.length > 0) {
+    removeInvalidTabs(invalidTabIds);
+    await persistState();
+  }
+
+  return foundTab;
+}
+
+function removeInvalidTabs(tabIds) {
+  for (const tabId of tabIds) {
+    windowHistory = removeTabFromAllWindowHistories(windowHistory, tabId);
+    tabMetadata = removeTabMetadata(tabMetadata, tabId);
+    lastActivationByWindow = removeTabFromActivationByWindow(lastActivationByWindow, tabId);
+  }
+}
+
+function replacePendingRestoreTabId(removedTabId, addedTabId) {
+  for (const [windowKey, pendingRestore] of Object.entries(pendingRestoreByWindow)) {
+    if (!pendingRestore || typeof pendingRestore !== 'object' || Array.isArray(pendingRestore)) {
+      delete pendingRestoreByWindow[windowKey];
+      continue;
+    }
+
+    pendingRestoreByWindow[windowKey] = {
+      ...pendingRestore,
+      targetTabId: pendingRestore.targetTabId === removedTabId
+        ? addedTabId
+        : pendingRestore.targetTabId,
+      historyAfterClose: replaceTabInTabIdList(
+        pendingRestore.historyAfterClose,
+        removedTabId,
+        addedTabId,
+        MAX_HISTORY_SIZE,
+      ),
+    };
+  }
+}
+
+async function safeGetTab(tabId) {
+  try {
+    if (!isValidTabId(tabId)) {
+      return null;
+    }
+
+    return await chrome.tabs.get(tabId);
+  } catch (error) {
+    if (!String(error?.message || '').includes('No tab with id')) {
+      logError('Error getting tab:', error, 'tabId:', tabId);
+    }
+
+    return null;
+  }
+}
+
+async function safeGetActiveTabInWindow(windowId) {
+  try {
+    if (!isValidWindowId(windowId)) {
+      return null;
+    }
+
+    const [activeTab] = await chrome.tabs.query({ active: true, windowId });
+    return activeTab || null;
+  } catch (error) {
+    logError('Error getting active tab in window:', error, 'windowId:', windowId);
+    return null;
+  }
+}
+
+async function safeUpdateTab(tabId, updateProperties) {
+  try {
+    if (!isValidTabId(tabId)) {
+      return null;
+    }
+
+    return await chrome.tabs.update(tabId, updateProperties);
+  } catch (error) {
+    if (!String(error?.message || '').includes('No tab with id')) {
+      logError('Error updating tab:', error, 'tabId:', tabId);
+    }
+
+    return null;
+  }
+}
+
+function isValidTabId(tabId) {
+  return Number.isInteger(tabId) && tabId >= 0;
+}
+
+function isValidWindowId(windowId) {
+  return Number.isInteger(windowId) && windowId >= 0;
+}
+
+function logError(message, error, ...args) {
+  const timestamp = new Date().toISOString();
+  console.error(`[${timestamp}] [ERROR] ${message}`, error, ...args);
+}
+
+if (typeof self !== 'undefined') {
+  self.addEventListener('unhandledrejection', (event) => {
+    logError('Unhandled promise rejection:', event.reason);
+    event.preventDefault();
+  });
+}
