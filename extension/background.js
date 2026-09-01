@@ -49,6 +49,12 @@ function planTabClose(history, removedTabId, lastActivation, removalTime) {
   };
 }
 
+function isPlaceholderReplacement(reorderedBySafari, activeTabId, history) {
+  return !reorderedBySafari &&
+    Number.isInteger(activeTabId) &&
+    !normalizeHistory(history).includes(activeTabId);
+}
+
 function startExtension(chromeApi) {
   const historyByWindow = new Map();
   const activationByWindow = new Map();
@@ -95,6 +101,13 @@ function startExtension(chromeApi) {
     });
   });
 
+  chromeApi.tabs.onUpdated.addListener((tabId, _changeInfo, tab) => {
+    const eventTime = Date.now();
+    runWhenReady(() => {
+      if (tab.active) recordActiveTab(tab.windowId, tabId, eventTime);
+    });
+  });
+
   chromeApi.tabs.onActivated.addListener((info) => {
     const eventTime = Date.now();
     runWhenReady(() => recordActiveTab(info.windowId, info.tabId, eventTime));
@@ -113,7 +126,21 @@ function startExtension(chromeApi) {
       removeFromEveryHistory(tabId);
       activationByWindow.delete(info.windowId);
 
-      if (!info.isWindowClosing && plan.targetTabId !== null) {
+      if (!info.isWindowClosing && plan.targetTabId !== null && !plan.reorderedBySafari) {
+        chromeApi.tabs.query({ active: true, windowId: info.windowId }, (tabs) => {
+          void chromeApi.runtime.lastError;
+          const activeTab = tabs?.[0];
+          if (activeTab && isPlaceholderReplacement(
+            plan.reorderedBySafari,
+            activeTab.id,
+            plan.history,
+          )) {
+            recordActiveTab(activeTab.windowId, activeTab.id, Date.now());
+          } else {
+            activateFirstAvailable(info.windowId, plan.history);
+          }
+        });
+      } else if (!info.isWindowClosing && plan.targetTabId !== null) {
         activateFirstAvailable(info.windowId, plan.history);
       }
     });
@@ -141,5 +168,10 @@ if (typeof chrome !== 'undefined' && chrome.tabs && chrome.windows) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { normalizeHistory, recordActivation, planTabClose };
+  module.exports = {
+    normalizeHistory,
+    recordActivation,
+    planTabClose,
+    isPlaceholderReplacement,
+  };
 }
